@@ -3,23 +3,8 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvPython = Join-Path $ProjectDir ".venv\Scripts\python.exe"
 
-if (Test-Path -LiteralPath $VenvPython) {
-    try {
-        & $VenvPython -c "import sys; print(sys.executable)" 2>$null
-        $VenvUsable = $LASTEXITCODE -eq 0
-    } catch {
-        $VenvUsable = $false
-    }
-} else {
-    $VenvUsable = $false
-}
-
-if (-not $VenvUsable) {
-    Write-Host "가상환경 경로가 유효하지 않아 현재 Python으로 다시 생성합니다."
-    & py -3.14 -m venv (Join-Path $ProjectDir ".venv")
-    if ($LASTEXITCODE -ne 0) {
-        throw "가상환경을 생성하지 못했습니다. Python 3.14 설치를 확인하세요."
-    }
+if (-not (Test-Path -LiteralPath $VenvPython)) {
+    throw "가상환경이 없습니다. 먼저 'py -V:3.14 -m venv .venv'를 실행하세요."
 }
 
 Push-Location $ProjectDir
@@ -40,9 +25,13 @@ try {
     & $VenvPython -m PyInstaller `
         --noconfirm `
         --clean `
+        --onefile `
+        --windowed `
+        --name VShopPersonal `
         --distpath (Join-Path $ProjectDir "dist") `
         --workpath (Join-Path $ProjectDir "build") `
-        (Join-Path $ProjectDir "VShopPersonal.spec")
+        --specpath $ProjectDir `
+        (Join-Path $ProjectDir "app.py")
 
     if ($LASTEXITCODE -ne 0) {
         throw "EXE 빌드에 실패했습니다."

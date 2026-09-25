@@ -1,4 +1,4 @@
-"""VALORANT 개인 상점 조회용 데스크톱 애플리케이션.
+"""VALORANT 상점·야시장·세트상품과 보유 VP/RP 조회용 애플리케이션.
 
 전체 데이터 흐름은 다음과 같다.
 
@@ -6,7 +6,7 @@
 2. 로그인 후 리디렉션 URL에서 임시 access token을 추출한다.
 3. 토큰에서 사용자 ID를 읽고 Riot Entitlements token을 발급받는다.
 4. 두 토큰으로 Riot 게임 클라이언트용 상점 서버에 요청한다.
-5. 상점이 반환한 상품 UUID를 공개 에셋 API의 이름/이미지와 결합한다.
+5. 상품 UUID를 공개 에셋 API의 이름/이미지와 결합하고 wallet에서 잔액을 읽는다.
 6. 처리한 결과를 PySide6 카드 UI로 보여준다.
 
 아이디와 비밀번호는 Riot 로그인 페이지가 직접 처리한다. 이 프로그램은 access
@@ -24,15 +24,19 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, QTemporaryFile, QThreadPool, QUrl, Signal, Slot
 from PySide6.QtGui import QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -41,7 +45,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +69,7 @@ VALORANT_API = "https://valorant-api.com/v1"
 
 # Riot 응답의 Cost는 "화폐 UUID: 가격" 형태다. 아래 UUID가 VP를 뜻한다.
 VP_CURRENCY_ID = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
+RP_CURRENCY_ID = "e59aa87c-4cbf-517a-5983-6e81511be9b7"
 
 # 게임 서비스는 요청한 클라이언트의 플랫폼 정보도 확인한다.
 # 이 Base64로 디코딩된 문자열은 Windows PC 플랫폼 정보를 나타낸다.
@@ -86,16 +93,144 @@ class ShopItem:
     """화면의 상품 카드 하나를 만드는 데 필요한 가공 완료 데이터."""
 
     name: str
-    price: int
+    price: int | None
     image: bytes | None
+    original_price: int | None = None
+    discount_percent: int | None = None
+    detail: str = ""
+    remaining_seconds: int | None = None
+    skin_level_id: str | None = None
+
+
+@dataclass
+class PreviewLevel:
+    name: str
+    video_url: str | None
+
+
+@lru_cache(maxsize=1)
+def skin_catalog() -> list[dict[str, Any]]:
+    """상세 창을 처음 열 때만 스킨 전체 목록을 받아 메모리에 보관한다."""
+    return request_json(f"{VALORANT_API}/weapons/skins?language=ko-KR").get("data") or []
+
+
+def fetch_preview_levels(level_id: str) -> list[PreviewLevel]:
+    """상점의 레벨 UUID로 원본 스킨을 찾아 모든 업그레이드 단계를 반환한다."""
+    for skin in skin_catalog():
+        levels = skin.get("levels") or []
+        if not any(level.get("uuid") == level_id for level in levels):
+            continue
+        result = []
+        for index, level in enumerate(levels, 1):
+            url = level.get("streamedVideo")
+            # 공개 영상 주소만 재생하며 인증 토큰은 전달하지 않는다.
+            if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != "https":
+                url = None
+            name = level.get("displayName") or f"레벨 {index}"
+            result.append(PreviewLevel(f"레벨 {index} · {name}", url))
+        return result
+    raise ApiError("이 스킨의 업그레이드 정보가 아직 등록되지 않았습니다.")
+
+
+def fetch_preview_video(url: str) -> bytes:
+    """HTTPS로 영상을 받아 Qt 자체 네트워크/TLS 구현 차이를 피한다."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ApiError("지원하지 않는 영상 주소입니다.")
+    request = urllib.request.Request(url, headers={"User-Agent": "VShopPersonal/1.0"})
+    limit = 128 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            chunks = []
+            size = 0
+            while chunk := response.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise ApiError("미리보기 영상이 너무 큽니다. (최대 128 MB)")
+                chunks.append(chunk)
+            if not size:
+                raise ApiError("영상 파일이 비어 있습니다.")
+            return b"".join(chunks)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise ApiError("영상을 다운로드하지 못했습니다. 연결을 확인하고 다시 시도해 주세요.") from exc
 
 
 @dataclass
 class ShopResult:
-    """오늘의 상품 목록과 다음 상점 교체까지 남은 시간."""
+    """상점·야시장·세트상품과 로그인 계정의 보유 VP/RP."""
 
-    items: list[ShopItem]
-    remaining_seconds: int
+    daily_items: list[ShopItem]
+    daily_remaining_seconds: int
+    night_market_items: list[ShopItem]
+    night_market_remaining_seconds: int
+    bundles: list[ShopItem]
+    vp_balance: int | None
+    rp_balance: int | None
+    wallet_error: str = ""
+
+
+def format_remaining(seconds: int, label: str) -> str:
+    """서버 조회 시점의 남은 시간을 읽기 쉬운 일/시간/분으로 표시한다."""
+    days, remainder = divmod(max(0, seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    parts = [f"{days}일"] if days else []
+    parts.extend([f"{hours}시간", f"{remainder // 60}분"])
+    return f" · {label}까지 약 {' '.join(parts)}"
+
+
+def bundle_price(bundle: dict[str, Any]) -> int | None:
+    """서버의 세트 할인가를 우선 사용한다. 0 VP와 가격 누락을 구분한다."""
+    total = bundle.get("TotalDiscountedCost") or {}
+    if VP_CURRENCY_ID in total:
+        return int(total[VP_CURRENCY_ID])
+    offers = bundle.get("ItemOffers") or []
+    if offers and all(VP_CURRENCY_ID in (o.get("DiscountedCost") or {}) for o in offers):
+        return sum(int(o["DiscountedCost"][VP_CURRENCY_ID]) for o in offers)
+    # 구형 응답은 각 구성품의 DiscountedPrice만 제공한다.
+    items = bundle.get("Items") or []
+    if items and all(
+        i.get("CurrencyID") == VP_CURRENCY_ID and i.get("DiscountedPrice") is not None
+        for i in items
+    ):
+        return sum(int(i["DiscountedPrice"]) for i in items)
+    return None
+
+
+def fetch_bundles(storefront: dict[str, Any]) -> list[ShopItem]:
+    """판매 중인 세트만 추출하고 공개 API의 한글 이름/이미지와 결합한다."""
+    featured = storefront.get("FeaturedBundle") or {}
+    entries = list(featured.get("Bundles") or [])
+    if featured.get("Bundle"):
+        entries.append(featured["Bundle"])
+    result = []
+    seen = set()
+    for bundle in entries:
+        asset_id = bundle.get("DataAssetID")
+        key = bundle.get("ID") or asset_id
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        remaining = bundle.get("DurationRemainingInSeconds")
+        if remaining is None:
+            remaining = featured.get("BundleRemainingDurationInSeconds")
+        if remaining is not None and int(remaining) <= 0:
+            continue
+        asset = {}
+        if asset_id:
+            try:
+                # Riot 인증 헤더를 공개 에셋 API로 전달하지 않는다.
+                asset = request_json(f"{VALORANT_API}/bundles/{asset_id}?language=ko-KR").get("data") or {}
+            except ApiError:
+                pass  # 신규 세트 에셋이 아직 없어도 가격과 판매 시간은 보여준다.
+        image_url = asset.get("displayIcon") or asset.get("displayIcon2")
+        result.append(ShopItem(
+            name=asset.get("displayName") or f"세트상품 ({asset_id or key})",
+            price=bundle_price(bundle),
+            image=request_bytes(image_url) if image_url else None,
+            original_price=(bundle.get("TotalBaseCost") or {}).get(VP_CURRENCY_ID),
+            detail=asset.get("description") or "",
+            remaining_seconds=int(remaining) if remaining is not None else None,
+        ))
+    return result
 
 
 # 이 코드 단락은 HTTP 요청을 보내고 JSON 응답을 파싱해 프로그램에서 사용할 수 있는 형태로 변환함
@@ -184,9 +319,9 @@ def jwt_subject(access_token: str) -> str:
         raise ApiError("로그인 토큰에서 사용자 ID를 확인하지 못했습니다.") from exc
 
 
-# 이 코드 단락은 인증 토큰과 지역 정보를 이용해 오늘의 상점 데이터를 가져와 화면용 형태로 가공함
+# 이 코드 단락은 인증 토큰과 지역 정보로 오늘의 상점과 야시장을 가져와 화면용 형태로 가공함
 def fetch_shop(access_token: str, region: str) -> ShopResult:
-    """인증 토큰을 사용해 오늘의 상점을 조회하고 UI용 데이터로 가공한다."""
+    """인증 토큰으로 상점·야시장·세트와 보유 재화를 조회한다."""
 
     # 1) 게임 서비스 요청에 필요한 최신 Riot 클라이언트 버전을 확인한다.
     version_response = request_json(f"{VALORANT_API}/version")
@@ -228,6 +363,18 @@ def fetch_shop(access_token: str, region: str) -> ShopResult:
         data={},
     )
 
+    # 잔액은 동일한 로그인 계정의 wallet에서 읽는다. 실패와 0 잔액은 다르다.
+    balances = {}
+    wallet_error = ""
+    try:
+        wallet = request_json(
+            f"https://pd.{region}.a.pvp.net/store/v1/wallet/{user_id}",
+            headers=game_headers,
+        )
+        balances = wallet.get("Balances") or {}
+    except ApiError as exc:
+        wallet_error = str(exc)
+
     # 5) 상점 JSON에서 오늘의 개별 스킨 제안만 꺼낸다.
     # 각 OfferID는 스킨 레벨을 가리키는 UUID다.
     layout = storefront.get("SkinsPanelLayout") or {}
@@ -237,7 +384,18 @@ def fetch_shop(access_token: str, region: str) -> ShopResult:
         offer_ids = layout.get("SingleItemOffers") or []
         offers = [{"OfferID": offer_id, "Cost": {}} for offer_id in offer_ids]
 
-    items: list[ShopItem] = []
+    # 오늘의 상점과 야시장에 같은 스킨이 있을 때 에셋 API를 중복 호출하지 않는다.
+    asset_cache: dict[str, dict[str, Any]] = {}
+
+    def get_skin_asset(item_id: str) -> dict[str, Any]:
+        if item_id not in asset_cache:
+            asset_response = request_json(
+                f"{VALORANT_API}/weapons/skinlevels/{item_id}?language=ko-KR"
+            )
+            asset_cache[item_id] = asset_response.get("data") or {}
+        return asset_cache[item_id]
+
+    daily_items: list[ShopItem] = []
     for offer in offers:
         offer_id = offer.get("OfferID")
         if not offer_id:
@@ -249,24 +407,71 @@ def fetch_shop(access_token: str, region: str) -> ShopResult:
 
         # 6) UUID만으로는 사람이 읽기 어려우므로 공개 에셋 API에서 한글 이름과
         # 이미지 URL을 찾는다. 이 요청에는 Riot 인증 토큰을 넣지 않는다.
-        asset_response = request_json(
-            f"{VALORANT_API}/weapons/skinlevels/{offer_id}?language=ko-KR"
-        )
-        asset = asset_response.get("data") or {}
+        asset = get_skin_asset(offer_id)
         name = asset.get("displayName") or "알 수 없는 스킨"
         image_url = asset.get("displayIcon")
         # 실제 이미지 파일은 displayIcon이 가리키는 CDN에서 내려받는다.
         image = request_bytes(image_url) if image_url else None
-        items.append(ShopItem(name=name, price=price, image=image))
+        daily_items.append(ShopItem(name=name, price=price, image=image, skin_level_id=offer_id))
 
-    if not items:
+    if not daily_items:
         raise ApiError("상점 응답에서 오늘의 상품을 찾지 못했습니다.")
 
+    # 야시장이 열려 있으면 BonusStore에 할인 상품이 들어온다. 야시장 기간이
+    # 아닐 때는 BonusStore 자체가 없으므로 빈 목록을 정상 상태로 취급한다.
+    bonus_store = storefront.get("BonusStore") or {}
+    night_market_items: list[ShopItem] = []
+    for bonus_offer in bonus_store.get("BonusStoreOffers") or []:
+        offer = bonus_offer.get("Offer") or {}
+        rewards = offer.get("Rewards") or []
+        item_id = rewards[0].get("ItemID") if rewards else None
+        if not item_id:
+            continue
+
+        original_costs = offer.get("Cost") or {}
+        discounted_costs = bonus_offer.get("DiscountCosts") or {}
+        original_price = int(
+            original_costs.get(VP_CURRENCY_ID)
+            or next(iter(original_costs.values()), 0)
+        )
+        discounted_price = int(
+            discounted_costs.get(VP_CURRENCY_ID)
+            or next(iter(discounted_costs.values()), 0)
+        )
+        discount_percent = int(bonus_offer.get("DiscountPercent") or 0)
+
+        asset = get_skin_asset(item_id)
+        name = asset.get("displayName") or "알 수 없는 스킨"
+        image_url = asset.get("displayIcon")
+        image = request_bytes(image_url) if image_url else None
+        night_market_items.append(
+            ShopItem(
+                name=name,
+                price=discounted_price,
+                image=image,
+                original_price=original_price,
+                discount_percent=discount_percent,
+                skin_level_id=item_id,
+            )
+        )
+
     # 서버가 초 단위로 준 남은 시간을 UI에서 시간/분으로 다시 표시한다.
-    remaining = int(
+    daily_remaining = int(
         layout.get("SingleItemOffersRemainingDurationInSeconds") or 0
     )
-    return ShopResult(items=items, remaining_seconds=remaining)
+    night_market_remaining = int(
+        bonus_store.get("BonusStoreRemainingDurationInSeconds") or 0
+    )
+    return ShopResult(
+        daily_items=daily_items,
+        daily_remaining_seconds=daily_remaining,
+        night_market_items=night_market_items,
+        night_market_remaining_seconds=night_market_remaining,
+        bundles=fetch_bundles(storefront),
+        vp_balance=int(balances[VP_CURRENCY_ID]) if VP_CURRENCY_ID in balances else None,
+        rp_balance=int(balances[RP_CURRENCY_ID]) if RP_CURRENCY_ID in balances else None,
+        wallet_error=wallet_error,
+    )
 
 
 # 이 코드 단락은 백그라운드 작업의 결과를 메인 UI 스레드로 전달하기 위한 신호를 정의함
@@ -301,11 +506,218 @@ class Worker(QRunnable):
 
 
 # 이 코드 단락은 상점 상품 하나를 카드 형태의 위젯으로 그려 화면에 표시함
+class PreviewDialog(QDialog):
+    """공개 영상 URL을 Qt Multimedia로 재생하는 업그레이드 상세 창."""
+
+    def __init__(self, item: ShopItem, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{item.name} · 업그레이드 미리보기")
+        self.resize(900, 650)
+        self.setMinimumSize(640, 480)
+        self.item = item
+        self.closed = False
+        self.worker: Worker | None = None
+        self.video_worker: Worker | None = None
+        self.video_file: QTemporaryFile | None = None
+        layout = QVBoxLayout(self)
+        heading = QLabel(item.name)
+        heading.setObjectName("pageTitle")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.levels = QComboBox()
+        self.levels.setEnabled(False)
+        self.levels.currentIndexChanged.connect(self.select_level)
+        layout.addWidget(self.levels)
+        self.video = QVideoWidget()
+        self.video.setMinimumHeight(240)
+        layout.addWidget(self.video, 1)
+        self.status = QLabel("업그레이드 정보를 가져오는 중…")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek.setRange(0, 0)
+        self.seek.setEnabled(False)
+        layout.addWidget(self.seek)
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("재생")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self.toggle_play)
+        controls.addWidget(self.play_button)
+        controls.addStretch()
+        controls.addWidget(QLabel("음량"))
+        volume = QSlider(Qt.Orientation.Horizontal)
+        volume.setRange(0, 100)
+        volume.setValue(50)
+        volume.setMaximumWidth(130)
+        controls.addWidget(volume)
+        self.retry_button = QPushButton("다시 불러오기")
+        self.retry_button.clicked.connect(self.load_levels)
+        controls.addWidget(self.retry_button)
+        close = QPushButton("닫기")
+        close.clicked.connect(self.reject)
+        controls.addWidget(close)
+        layout.addLayout(controls)
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.audio.setVolume(0.5)
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video)
+        volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
+        self.seek.sliderMoved.connect(self.player.setPosition)
+        self.player.durationChanged.connect(lambda duration: self.seek.setRange(0, duration))
+        self.player.positionChanged.connect(self.update_position)
+        self.player.seekableChanged.connect(self.seek.setEnabled)
+        self.player.playbackStateChanged.connect(self.update_play_button)
+        self.player.mediaStatusChanged.connect(self.media_status)
+        self.player.errorOccurred.connect(self.media_error)
+        self.finished.connect(self.cleanup)
+        self.load_levels()
+
+    def load_levels(self) -> None:
+        if self.worker or self.video_worker or self.closed:
+            return
+        self.player.stop()
+        self.levels.setEnabled(False)
+        self.play_button.setEnabled(False)
+        self.retry_button.setEnabled(False)
+        self.status.setText("업그레이드 정보를 가져오는 중…")
+        level_id = self.item.skin_level_id or ""
+        self.worker = Worker(lambda: fetch_preview_levels(level_id))
+        self.worker.signals.finished.connect(self.levels_loaded)
+        self.worker.signals.failed.connect(self.load_failed)
+        QThreadPool.globalInstance().start(self.worker)
+
+    @Slot(object)
+    def levels_loaded(self, levels: list[PreviewLevel]) -> None:
+        self.worker = None
+        if self.closed:
+            return
+        self.retry_button.setEnabled(True)
+        self.levels.blockSignals(True)
+        self.levels.clear()
+        for level in levels:
+            suffix = "" if level.video_url else " (영상 없음)"
+            self.levels.addItem(level.name + suffix, level.video_url)
+        self.levels.blockSignals(False)
+        self.levels.setEnabled(bool(levels))
+        if not levels:
+            self.status.setText("등록된 업그레이드 단계가 없습니다.")
+            return
+        self.select_level(self.levels.currentIndex())
+
+    @Slot(str)
+    def load_failed(self, message: str) -> None:
+        self.worker = None
+        if not self.closed:
+            self.status.setText(message)
+            self.retry_button.setEnabled(True)
+
+    @Slot(int)
+    def select_level(self, index: int) -> None:
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.clear_video_file()
+        self.seek.setValue(0)
+        self.seek.setEnabled(False)
+        url = self.levels.itemData(index) if index >= 0 else None
+        self.play_button.setEnabled(bool(url))
+        self.video.setVisible(bool(url))
+        if not url:
+            self.status.setText("이 단계에는 미리보기 영상이 없습니다.")
+            return
+        self.status.setText("재생을 누르면 이 단계의 영상을 불러옵니다.")
+
+    def clear_video_file(self) -> None:
+        if self.video_file:
+            self.video_file.remove()
+            self.video_file = None
+
+    def toggle_play(self) -> None:
+        if self.player.source().isEmpty():
+            url = self.levels.currentData()
+            if not url or self.video_worker:
+                return
+            self.status.setText("미리보기 영상을 다운로드하는 중…")
+            self.levels.setEnabled(False)
+            self.play_button.setEnabled(False)
+            self.retry_button.setEnabled(False)
+            self.video_worker = Worker(lambda: fetch_preview_video(url))
+            self.video_worker.signals.finished.connect(self.video_loaded)
+            self.video_worker.signals.failed.connect(self.video_failed)
+            QThreadPool.globalInstance().start(self.video_worker)
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            if self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                self.player.setPosition(0)
+            self.player.play()
+
+    @Slot(object)
+    def video_loaded(self, data: bytes) -> None:
+        self.video_worker = None
+        if self.closed:
+            return
+        temporary = QTemporaryFile(self)
+        if not temporary.open() or temporary.write(data) != len(data):
+            temporary.remove()
+            self.video_failed("영상 임시 파일을 만들지 못했습니다. 디스크 공간을 확인해 주세요.")
+            return
+        temporary.close()
+        self.video_file = temporary
+        self.levels.setEnabled(True)
+        self.play_button.setEnabled(True)
+        self.retry_button.setEnabled(True)
+        self.player.setSource(QUrl.fromLocalFile(temporary.fileName()))
+        self.player.play()
+
+    @Slot(str)
+    def video_failed(self, message: str) -> None:
+        self.video_worker = None
+        if not self.closed:
+            self.status.setText(message)
+            self.levels.setEnabled(True)
+            self.play_button.setEnabled(True)
+            self.retry_button.setEnabled(True)
+
+    def update_position(self, position: int) -> None:
+        if not self.seek.isSliderDown():
+            self.seek.setValue(position)
+
+    def update_play_button(self, state: QMediaPlayer.PlaybackState) -> None:
+        self.play_button.setText("일시정지" if state == QMediaPlayer.PlaybackState.PlayingState else "재생")
+
+    def media_status(self, status: QMediaPlayer.MediaStatus) -> None:
+        if self.closed or self.player.source().isEmpty():
+            return
+        if status in (QMediaPlayer.MediaStatus.LoadingMedia, QMediaPlayer.MediaStatus.BufferingMedia):
+            self.status.setText("영상을 불러오는 중…")
+        elif status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+            self.status.setText("재생·일시정지 버튼으로 영상을 조작할 수 있습니다.")
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.status.setText("재생이 끝났습니다. 재생 버튼을 누르면 다시 볼 수 있습니다.")
+
+    def media_error(self, error: QMediaPlayer.Error, message: str) -> None:
+        if not self.closed and error != QMediaPlayer.Error.NoError:
+            self.status.setText("영상을 재생하지 못했습니다. 연결을 확인한 뒤 다시 불러오세요.")
+            self.status.setToolTip(message)
+            self.play_button.setEnabled(False)
+
+    def cleanup(self, _result: int) -> None:
+        # 창 닫기/ESC 모두 재생과 소리를 중지한다. 늦게 도착한 조회 결과는 무시한다.
+        self.closed = True
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.clear_video_file()
+
+
 class ShopCard(QFrame):
-    """스킨 이미지, 이름, VP 가격을 보여주는 상품 카드 위젯."""
+    """스킨 이미지, 이름, VP 가격과 선택적인 야시장 할인을 보여준다."""
 
     def __init__(self, item: ShopItem) -> None:
         super().__init__()
+        self.item = item
         self.setObjectName("shopCard")
         self.setMinimumSize(330, 250)
 
@@ -334,13 +746,50 @@ class ShopCard(QFrame):
         name_label.setWordWrap(True)
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        price_label = QLabel(f"{item.price:,} VP" if item.price else "가격 정보 없음")
+        if item.original_price and item.price is not None and item.original_price > item.price:
+            price_text = f"{item.original_price:,} VP  →  {item.price:,} VP"
+        else:
+            price_text = f"{item.price:,} VP" if item.price is not None else "가격 정보 없음"
+
+        price_label = QLabel(price_text)
         price_label.setObjectName("price")
         price_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addWidget(image_label, 1)
         layout.addWidget(name_label)
+        if item.discount_percent:
+            discount_label = QLabel(f"{item.discount_percent}% 할인")
+            discount_label.setObjectName("discount")
+            discount_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(discount_label)
         layout.addWidget(price_label)
+        if item.detail:
+            detail = QLabel(item.detail)
+            detail.setWordWrap(True)
+            detail.setObjectName("subtitle")
+            detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(detail)
+        if item.remaining_seconds is not None:
+            remaining = QLabel(format_remaining(item.remaining_seconds, "판매 종료").removeprefix(" · "))
+            remaining.setWordWrap(True)
+            remaining.setObjectName("subtitle")
+            remaining.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(remaining)
+        if item.skin_level_id:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            preview = QPushButton("업그레이드 미리보기")
+            preview.clicked.connect(self.open_preview)
+            layout.addWidget(preview)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.item.skin_level_id:
+            self.open_preview()
+        super().mouseReleaseEvent(event)
+
+    def open_preview(self) -> None:
+        dialog = PreviewDialog(self.item, self.window())
+        dialog.exec()
+        dialog.deleteLater()
 
 
 # 이 코드 단락은 앱의 메인 창과 화면 전환, 사용자 이벤트를 모두 관리함
@@ -392,7 +841,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("VShop Personal")
         title.setObjectName("title")
-        subtitle = QLabel("내 PC에서만 실행되는 VALORANT 오늘의 상점 뷰어")
+        subtitle = QLabel("내 PC에서 확인하는 발로란트 상점")
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
 
@@ -473,7 +922,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.loading_label = QLabel("상점 정보를 가져오는 중…")
+        self.loading_label = QLabel("상점·야시장·세트상품과 보유 VP/RP를 가져오는 중…")
         self.loading_label.setObjectName("pageTitle")
         self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         detail = QLabel("로그인 토큰은 메모리에서만 사용됩니다.")
@@ -484,7 +933,7 @@ class MainWindow(QMainWindow):
 
     # 이 코드 단락은 상점 상품 목록과 새로고침, 로그아웃 버튼을 담은 화면을 구성함
     def build_shop_page(self) -> QWidget:
-        """상품 카드, 새로고침, 로그아웃 버튼이 있는 상점 화면을 만든다."""
+        """세 가지 상점 탭과 공통 잔액 영역을 만든다."""
 
         page = QWidget()
         outer = QVBoxLayout(page)
@@ -492,33 +941,96 @@ class MainWindow(QMainWindow):
         outer.setSpacing(16)
 
         top = QHBoxLayout()
-        heading_box = QVBoxLayout()
-        heading = QLabel("오늘의 상점")
+        heading = QLabel("VALORANT 상점")
         heading.setObjectName("titleSmall")
-        self.shop_meta = QLabel("")
-        self.shop_meta.setObjectName("subtitle")
-        heading_box.addWidget(heading)
-        heading_box.addWidget(self.shop_meta)
 
         refresh = QPushButton("새로고침")
         refresh.clicked.connect(self.refresh_shop)
         logout = QPushButton("로그아웃")
         logout.clicked.connect(self.logout)
-        top.addLayout(heading_box)
+        top.addWidget(heading)
         top.addStretch()
         top.addWidget(refresh)
         top.addWidget(logout)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 잔액 영역은 탭 바깥에 있어 어느 상점 탭에서도 계속 보인다.
+        wallet_row = QHBoxLayout()
+        self.vp_label = QLabel("보유 VP: —")
+        self.rp_label = QLabel("보유 RP: —")
+        for label in (self.vp_label, self.rp_label):
+            label.setObjectName("wallet")
+            wallet_row.addWidget(label)
+        wallet_row.addStretch()
+        self.wallet_meta = QLabel("")
+        self.wallet_meta.setObjectName("subtitle")
+        wallet_row.addWidget(self.wallet_meta)
+
+        # 오늘의 상점 탭
+        daily_page = QWidget()
+        daily_layout = QVBoxLayout(daily_page)
+        daily_layout.setContentsMargins(0, 12, 0, 0)
+        self.shop_meta = QLabel("")
+        self.shop_meta.setObjectName("subtitle")
+        daily_scroll = QScrollArea()
+        daily_scroll.setWidgetResizable(True)
+        daily_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.cards_host = QWidget()
         self.cards_grid = QGridLayout(self.cards_host)
         self.cards_grid.setSpacing(16)
-        scroll.setWidget(self.cards_host)
+        daily_scroll.setWidget(self.cards_host)
+        daily_layout.addWidget(self.shop_meta)
+        daily_layout.addWidget(daily_scroll, 1)
+
+        # 야시장 탭. 야시장이 열리지 않은 기간에도 탭은 유지하고 안내 문구를 보인다.
+        night_market_page = QWidget()
+        night_market_layout = QVBoxLayout(night_market_page)
+        night_market_layout.setContentsMargins(0, 12, 0, 0)
+        self.night_market_meta = QLabel("")
+        self.night_market_meta.setObjectName("subtitle")
+        self.night_market_empty = QLabel(
+            "현재 야시장이 열려 있지 않습니다.\n야시장 이벤트가 시작되면 할인 상품이 여기에 표시됩니다."
+        )
+        self.night_market_empty.setObjectName("emptyState")
+        self.night_market_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.night_market_empty.setWordWrap(True)
+        night_market_scroll = QScrollArea()
+        night_market_scroll.setWidgetResizable(True)
+        night_market_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.night_market_cards_host = QWidget()
+        self.night_market_grid = QGridLayout(self.night_market_cards_host)
+        self.night_market_grid.setSpacing(16)
+        night_market_scroll.setWidget(self.night_market_cards_host)
+        night_market_layout.addWidget(self.night_market_meta)
+        night_market_layout.addWidget(self.night_market_empty)
+        night_market_layout.addWidget(night_market_scroll, 1)
+
+        self.shop_tabs = QTabWidget()
+        self.shop_tabs.addTab(daily_page, "오늘의 상점")
+        self.shop_tabs.addTab(night_market_page, "야시장")
+
+        bundles_page = QWidget()
+        bundles_layout = QVBoxLayout(bundles_page)
+        bundles_layout.setContentsMargins(0, 12, 0, 0)
+        self.bundles_meta = QLabel("")
+        self.bundles_meta.setObjectName("subtitle")
+        self.bundles_empty = QLabel("현재 판매 중인 세트상품이 없습니다.")
+        self.bundles_empty.setObjectName("emptyState")
+        self.bundles_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bundles_scroll = QScrollArea()
+        bundles_scroll.setWidgetResizable(True)
+        bundles_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        bundles_host = QWidget()
+        self.bundles_grid = QGridLayout(bundles_host)
+        self.bundles_grid.setSpacing(16)
+        bundles_scroll.setWidget(bundles_host)
+        bundles_layout.addWidget(self.bundles_meta)
+        bundles_layout.addWidget(self.bundles_empty)
+        bundles_layout.addWidget(bundles_scroll, 1)
+        self.shop_tabs.addTab(bundles_page, "세트상품")
 
         outer.addLayout(top)
-        outer.addWidget(scroll, 1)
+        outer.addLayout(wallet_row)
+        outer.addWidget(self.shop_tabs, 1)
         return page
 
     # 이 코드 단락은 앱 전체의 색상과 위젯 모양을 일관되게 꾸미기 위한 스타일을 적용함
@@ -538,6 +1050,16 @@ class MainWindow(QMainWindow):
             }
             QLabel#itemName { font-size: 17px; font-weight: 700; }
             QLabel#price { color: #f6d365; font-size: 16px; font-weight: 700; }
+            QLabel#wallet {
+                background: #181e2b; border-radius: 8px; padding: 10px 16px;
+                color: #f6d365; font-size: 16px; font-weight: 700;
+            }
+            QLabel#discount {
+                color: #ff6572; font-size: 15px; font-weight: 700;
+            }
+            QLabel#emptyState {
+                padding: 28px; color: #aeb6c6; font-size: 16px;
+            }
             QFrame#shopCard {
                 background: #181e2b; border: 1px solid #283043; border-radius: 12px;
             }
@@ -552,6 +1074,13 @@ class MainWindow(QMainWindow):
                 background: #181e2b; border: 1px solid #35415b;
                 border-radius: 7px; padding: 10px;
             }
+            QTabWidget::pane { border: 0; }
+            QTabBar::tab {
+                background: #181e2b; color: #aeb6c6;
+                padding: 11px 24px; margin-right: 4px;
+                border-top-left-radius: 7px; border-top-right-radius: 7px;
+            }
+            QTabBar::tab:selected { background: #ff4655; color: white; }
             QScrollArea { background: transparent; }
             """
         )
@@ -615,7 +1144,7 @@ class MainWindow(QMainWindow):
         if not self.access_token:
             self.show_error("로그인이 필요합니다.")
             return
-        self.loading_label.setText("상점 정보를 가져오는 중…")
+        self.loading_label.setText("상점·야시장·세트상품과 보유 VP/RP를 가져오는 중…")
         token = self.access_token
         region = self.region
         # fetch_shop은 네트워크 I/O를 하므로 메인 UI 스레드에서 직접 호출하지 않는다.
@@ -635,29 +1164,55 @@ class MainWindow(QMainWindow):
     @Slot(object)
     # 이 코드 단락은 백그라운드에서 받아온 상점 데이터를 화면에 맞게 배치하고 표시함
     def on_shop_loaded(self, result: ShopResult) -> None:
-        """백그라운드 조회 결과를 받아 기존 카드를 새 카드로 교체한다."""
+        """세 가지 상점 탭과 공통 잔액을 조회 결과로 갱신한다."""
 
-        # 새로고침할 때 이전 카드 위젯이 겹치지 않도록 모두 제거한다.
-        while self.cards_grid.count():
-            item = self.cards_grid.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        def clear_grid(grid: QGridLayout) -> None:
+            while grid.count():
+                layout_item = grid.takeAt(0)
+                widget = layout_item.widget()
+                if widget:
+                    widget.deleteLater()
 
-        # 행/열 인덱스를 계산해 상품을 두 열로 배치한다.
-        for index, shop_item in enumerate(result.items):
+        # 새로고침할 때 이전 카드 위젯이 겹치지 않도록 각 탭을 비운다.
+        clear_grid(self.cards_grid)
+        clear_grid(self.night_market_grid)
+        clear_grid(self.bundles_grid)
+
+        for index, shop_item in enumerate(result.daily_items):
             self.cards_grid.addWidget(ShopCard(shop_item), index // 2, index % 2)
 
-        # 초 단위 남은 시간을 사람이 읽기 쉬운 시간/분으로 바꾼다.
-        hours, remainder = divmod(result.remaining_seconds, 3600)
-        minutes = remainder // 60
-        remaining_text = (
-            f" · 교체까지 약 {hours}시간 {minutes}분"
-            if result.remaining_seconds
-            else ""
-        )
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.shop_meta.setText(f"{now} 기준{remaining_text}")
+        daily_remaining = format_remaining(
+            result.daily_remaining_seconds, "교체"
+        )
+        self.shop_meta.setText(f"{now} 기준{daily_remaining}")
+
+        if result.night_market_items:
+            self.night_market_empty.hide()
+            for index, shop_item in enumerate(result.night_market_items):
+                self.night_market_grid.addWidget(
+                    ShopCard(shop_item), index // 2, index % 2
+                )
+            night_remaining = format_remaining(
+                result.night_market_remaining_seconds, "종료"
+            )
+            self.night_market_meta.setText(f"{now} 기준{night_remaining}")
+        else:
+            self.night_market_empty.show()
+            self.night_market_meta.setText(f"{now} 기준 · 현재 야시장 기간이 아닙니다")
+
+        for index, bundle in enumerate(result.bundles):
+            self.bundles_grid.addWidget(ShopCard(bundle), index // 2, index % 2)
+        self.bundles_empty.setVisible(not result.bundles)
+        self.bundles_meta.setText(f"{now} 기준 · 판매 중인 세트 {len(result.bundles)}개")
+        for label, currency, value in (
+            (self.vp_label, "VP", result.vp_balance),
+            (self.rp_label, "RP", result.rp_balance),
+        ):
+            label.setText(f"보유 {currency}: {value:,}" if value is not None else f"보유 {currency}: 조회 불가")
+            label.setToolTip(result.wallet_error or ("" if value is not None else "서버 응답에 잔액이 없습니다."))
+        self.wallet_meta.setText(f"{now} 조회")
+
         self.pages.setCurrentWidget(self.shop_page)
         self.worker = None
 
@@ -685,6 +1240,15 @@ class MainWindow(QMainWindow):
         # Riot 로그인 세션이 남지 않도록 WebView의 쿠키와 캐시를 명시적으로 삭제한다.
         self.web_profile.cookieStore().deleteAllCookies()
         self.web_profile.clearHttpCache()
+        self.vp_label.setText("보유 VP: —")
+        self.rp_label.setText("보유 RP: —")
+        self.wallet_meta.clear()
+        # 다른 계정으로 로그인하다 실패했을 때 이전 계정 상품이 남지 않게 한다.
+        for grid in (self.cards_grid, self.night_market_grid, self.bundles_grid):
+            while grid.count():
+                item = grid.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
         self.pages.setCurrentWidget(self.home_page)
 
 
