@@ -1256,11 +1256,43 @@ class MainWindow(QMainWindow):
 def main() -> int:
     """Qt 이벤트 루프를 시작하고 메인 창을 표시한다."""
 
+    if "--check-https" in sys.argv:
+        return check_https()
+
     app = QApplication(sys.argv)
     app.setApplicationName("VShop Personal")
     window = MainWindow()
     window.show()
     return app.exec()
+
+
+def check_https() -> int:
+    """배포 EXE 자체로 TLS 로딩과 공개 API를 검사한다. 계정 토큰은 사용하지 않는다."""
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check-https", action="store_true")
+    parser.add_argument("--report", required=True)
+    args = parser.parse_args()
+    report = {"ok": False, "frozen": bool(getattr(sys, "frozen", False))}
+    try:
+        import ssl
+        report["openssl"] = ssl.OPENSSL_VERSION
+        report["https_handler"] = hasattr(urllib.request, "HTTPSHandler")
+        if not report["https_handler"]:
+            raise RuntimeError("HTTPSHandler is unavailable")
+        context = ssl.create_default_context()
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+        response = request_json(f"{VALORANT_API}/version")
+        if response.get("status") != 200 or not response.get("data", {}).get("riotClientVersion"):
+            raise RuntimeError("Public version API returned an unexpected response")
+        report["public_api_status"] = response["status"]
+        report["ok"] = True
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    Path(args.report).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":

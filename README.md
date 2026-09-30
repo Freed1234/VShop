@@ -24,7 +24,7 @@ Windows PC에서 개인적으로 실행하는 VALORANT 상점·야시장·세트
 Python 3.10~3.14를 설치한 뒤 PowerShell에서 이 폴더로 이동합니다.
 
 ```powershell
-py -V:3.14 -m venv .venv
+py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
@@ -89,21 +89,20 @@ dist\VShopPersonal.exe
 느릴 수 있습니다. 개인 빌드에는 코드 서명이 없으므로 Windows SmartScreen이 경고를
 표시할 수도 있습니다.
 
-가상환경 실행 시 `Unable to create process`가 나오면 `.venv`가 삭제된 Python을
-가리키는 상태입니다. 아래 명령으로 가상환경만 다시 만드세요.
+가상환경이 없거나 삭제된 Python을 가리키면 빌드 스크립트가 정상 Python을 찾아
+가상환경을 생성합니다. 손상된 환경은 `.venv.backup-*`으로 보존합니다.
+Python이 PATH에 등록되어 있지 않으면 실행 파일 경로를 지정하세요.
 
 ```powershell
-Remove-Item -LiteralPath .\.venv -Recurse
-py -V:3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File .\build-exe.ps1 -PythonPath "C:\path\python.exe"
 ```
 
 ## 문제 해결
 
 - `HTTP 401/403`: 로그아웃한 뒤 다시 로그인합니다.
 - 클라이언트 버전 오류: 잠시 후 다시 실행합니다.
-- 로그인 페이지가 비어 있음: Windows와 Microsoft Edge WebView 구성 요소를
-  업데이트하고 다시 시도합니다.
+- 로그인 페이지가 비어 있음: 인터넷 연결과 Riot 로그인 서비스 상태를 확인합니다.
+  이 앱은 Qt WebEngine을 사용하며 Edge WebView2를 사용하지 않습니다.
 - 상점 응답 오류: Riot의 비공개 엔드포인트가 변경됐을 가능성이 있습니다.
 
 ## 파일 구성
@@ -112,3 +111,19 @@ py -V:3.14 -m venv .venv
 - `requirements.txt`: Python 의존성
 - `requirements-build.txt`: EXE 빌드 의존성
 - `build-exe.ps1`: 단일 EXE 빌드 스크립트
+- `VShopPersonal.spec`: Python과 일치하는 OpenSSL DLL을 명시적으로 포함하는 빌드 설정
+
+## EXE의 HTTPS 통신 검사
+
+PowerShell에서 아래 명령을 실행하면 계정 로그인 없이 공개 버전 API로 검사합니다.
+검사 결과의 `ok`와 `frozen`이 모두 `true`이면 EXE 내부 HTTPS 요청이 성공한 것입니다.
+
+```powershell
+$check = Start-Process -FilePath .\dist\VShopPersonal.exe -ArgumentList '--check-https --report https-check.json' -Wait -PassThru
+Get-Content https-check.json
+```
+
+`unknown url type: https` 오류는 이번 빌드에서 호환되지 않는 System32 OpenSSL DLL이
+포함되면서 발생했습니다. `.spec`이 Python의 `_ssl.pyd`와 같은 폴더의 OpenSSL DLL을
+사용하도록 수정했습니다. 인증서 검증을 끄거나 Windows DLL을 변경하지 않습니다.
+빌드 설정 참고: https://pyinstaller.org/en/stable/spec-files.html
