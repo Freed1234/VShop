@@ -3,4 +3,7 @@ __pycache__/
 *.pyc
 build/
 dist/
-*.spec
+.build-venv/
+release/
+VShop-main-Windows11-x64.zip
+VShop-main-Windows11-x64/

@@ -1,129 +1,92 @@
-# VShop Personal (Python)
+# VShop-main — Windows 11 배포본
 
-Windows PC에서 개인적으로 실행하는 VALORANT 상점·야시장·세트상품 및 보유 VP/RP 뷰어입니다.
+Downloads의 VShop-main 소스를 별도 폴더에 복사해 만든 프로젝트입니다.
+오늘의 상점·야시장·세트상품·VP/RP 잔액·업그레이드 영상 미리보기 기능을 유지합니다.
 
-이 프로젝트는 Riot Games의 공식 앱이 아니며, Riot이 공개한 개발자용 상점 API를
-사용하지 않습니다. 게임 클라이언트용 비공개 서비스가 변경되거나 접근을 제한하면
-예고 없이 작동하지 않을 수 있습니다. Riot의 현재 개발자 정책에서는 온라인 상점
-추적 앱이 승인 대상이 아닙니다.
+## 실행과 배포
 
-## 보안 원칙
+release/VShop-main-Windows11-x64.zip을 **전체 압축 해제**하고
+VShopPersonal/VShopPersonal.exe를 실행하세요. 실행 PC에는 Python 설치가 필요 없습니다.
+EXE 옆의 _internal 폴더도 함께 배포해야 합니다.
+Intel/AMD 기반 Windows 11 x64를 대상으로 합니다. ARM은 미검증입니다.
+인터넷 연결과 Riot 계정이 필요합니다.
 
-- 로그인 화면은 `auth.riotgames.com`의 Riot 공식 페이지입니다.
-- 비밀번호를 애플리케이션 코드에서 읽거나 저장하지 않습니다.
-- access token은 실행 중 메모리에서만 사용하고 파일에 저장하지 않습니다.
-- 별도 제작자 서버를 사용하지 않습니다.
-- 로그아웃하면 WebView 쿠키를 삭제합니다.
-- 자동 구매 기능은 포함하지 않습니다.
+계정 지역을 선택하고 로그인하면 세 가지 상점 탭과 VP/RP 잔액을 볼 수 있습니다.
+새로고침 버튼은 상점과 잔액을 함께 다시 조회합니다. 실시간 자동 갱신은 아닙니다.
+야시장 기간이 아니거나 데이터가 없으면 해당 탭에 안내가 나옵니다.
+스킨 카드의 업그레이드 미리보기에서는 레벨 선택, 재생/일시정지, 탐색, 음량 조절을 지원합니다.
+영상은 공개 API에서 임시 다운로드하며 단계 전환/닫기 시 정리합니다.
 
-소스가 공개돼 있어도 다른 사람이 배포한 EXE가 같은 소스로 빌드됐다는 보장은
-없습니다. 가능하면 이 폴더의 소스를 직접 실행하세요.
+로그인 화면이 비거나 그래픽 문제가 있으면 앱을 닫고 Run-Compatibility.cmd를 실행합니다.
+내장 브라우저의 GPU 가속을 끄는 모드이며 인증서 검사나 브라우저 보안 격리를 끄지 않습니다.
+영상 코덱이나 모든 그래픽 문제를 해결한다고 보장하지는 않습니다.
 
-## 설치
+## 변경 내용
 
-Python 3.10~3.14를 설치한 뒤 PowerShell에서 이 폴더로 이동합니다.
+- 누락된 VShopPersonal.spec 복구 및 Git의 *.spec 제외 제거.
+- Windows 폴더형 EXE, ZIP 및 SHA-256 체크섬 생성.
+- 빌드 DLL 검색 경로 제한으로 다른 앱의 ICU DLL 유입 방지.
+- Python의 _ssl.pyd와 일치하는 OpenSSL DLL 쌍을 명시적으로 포함하고 해시 검사.
+- Qt WebEngine 및 Qt Multimedia/FFmpeg 구성 요소 포함 검사.
+- 호환 모드, 시작 환경/오류 종류 로그, 로그인 페이지 실패 안내 추가.
+- 배포 EXE 자체에서 UI·WebEngine·TLS·MP4 디코딩을 검사하는 오프라인 모드 추가.
+- 기존 --check-https --report 공개 API 검사 기능 유지.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+상점 API 요청·로그인·영상 다운로드 및 재생 로직은 원본을 유지합니다.
+기존 REPAIR-NOTES.md는 제공된 소스에 들어 있던 과거 기록입니다.
+이번 작업의 검사 결과는 validation 폴더를 확인하세요.
 
-## 실행
+## 개발 PC에서 빌드
 
-```powershell
-.\.venv\Scripts\python.exe app.py
-```
+빌드하는 PC에만 Python 3.12 x64가 필요합니다.
 
-1. 계정 지역을 선택합니다. 한국 계정은 `한국 (KR)`을 사용합니다.
-2. `Riot 계정으로 로그인`을 누릅니다.
-3. Riot 공식 페이지에서 로그인과 2단계 인증을 완료합니다.
-4. 상점 상품과 보유 VP/RP가 표시될 때까지 기다립니다.
+    powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
 
-상점 화면은 `오늘의 상점`, `야시장`, `세트상품` 탭으로 나뉩니다. 야시장이 열려 있으면
-할인 전 가격, 할인율, 할인가와 종료까지 남은 시간이 표시됩니다. 야시장 기간이
-아니면 해당 탭에 안내 문구가 표시됩니다.
+Python 경로를 직접 지정할 수도 있습니다.
 
-`세트상품` 탭에는 현재 판매 중인 세트들의 이름, 이미지, 서버가 제공한 세트 가격과
-판매 종료까지 남은 시간이 표시됩니다. 새 세트가 공개 에셋 API에 아직 등록되지
-않았다면 임시 이름과 가격을 표시하며, 가격이 누락되면 `가격 정보 없음`으로 표시합니다.
+    .\build-exe.ps1 -PythonPath 'C:\Path\To\Python312\python.exe'
 
-보유 VP와 RP(레디어나이트 포인트)는 탭 위 공통 영역에서 항상 확인할 수 있습니다.
-`새로고침`을 누르면 상품과 잔액을 함께 다시 조회합니다. 시간과 잔액은 표시된 조회
-시점 기준이며 실시간 자동 갱신은 아닙니다. 잔액 요청 실패는 `조회 불가`로 표시하고,
-마우스를 올리면 오류를 확인할 수 있습니다. 로그아웃하면 잔액과 상품 표시를 비웁니다.
+-VenvDir와 -WorkDir로 가상환경/중간 파일 경로를 지정할 수 있습니다.
+기본값은 .build-venv와 build입니다. 기존 환경에 고정 버전이 설치되어 있으면 -SkipInstall을 사용할 수 있습니다.
+다시 빌드하면 이 복사본의 dist/release 산출물을 교체합니다.
+버전: Python 3.12, PySide6 6.11.2, PyInstaller 6.22.2, hooks-contrib 2026.7.
 
-응답 구조 참고: [상점 응답](https://valapidocs.techchrism.me/endpoint/storefront),
-[잔액 응답](https://github.com/HeyM1ke/ValorantClientAPI/blob/master/Docs/UserBalance.md).
+소스 실행:
 
-앱을 다시 실행하면 보안을 위해 다시 로그인해야 합니다.
+    .\.build-venv\Scripts\python.exe launcher.py
+    .\.build-venv\Scripts\python.exe launcher.py --software-rendering
 
-## 업그레이드 영상 미리보기
+## 검증
 
-오늘의 상점 또는 야시장에서 스킨 카드나 `업그레이드 미리보기` 버튼을 누릅니다.
-상세 창에서 레벨을 선택하고 `재생`을 누르면 해당 단계의 영상을 볼 수 있습니다.
-재생/일시정지, 재생 위치 이동, 음량 조절을 지원하며 창을 닫으면 소리도 중지됩니다.
-영상이 등록되지 않은 단계에는 `영상 없음`을 표시합니다. 조회 또는 재생 오류가
-나면 `다시 불러오기`를 누르세요. 세트 카드 자체에는 개별 스킨 미리보기 버튼이 없습니다.
+    .\test-portable.ps1
 
-공개 스킨 API의 `levels[].streamedVideo` 주소에서 영상을 임시 파일로 받아 재생합니다.
-최초 상세 조회 때 스킨 목록을 메모리에 캐시하며, 영상 요청에는 Riot 인증 토큰을
-보내지 않습니다. 단계 전환이나 창 닫기 시 임시 파일을 정리합니다. 영상 파일을
-EXE에 포함하지 않으므로 인터넷 연결이 필요합니다. 영상당 최대 128 MB를 지원합니다.
+ZIP을 새 경로에 풀고 PATH에서 Python을 제외하며 Python/Qt 환경 변수를 정리한 후
+일반/호환 모드에서 실제 메인 화면, 모의 상점·잔액, 로그아웃, 내장 브라우저,
+인증서 검증 설정, 1초짜리 합성 MP4의 프레임 디코딩과 임시 파일 정리를 확인합니다.
+계정이나 인터넷을 사용하지 않습니다. 테스트 폴더와 JSON 결과는 보존됩니다.
 
-## 단일 EXE 만들기
+공개 API HTTPS 검사는 별도로 수행합니다. 보고서의 ok/frozen이 모두 true여야 합니다.
 
-먼저 `app.py`가 정상 실행되는지 확인한 다음 아래 명령을 실행합니다.
+    $p = Start-Process .\dist\VShopPersonal\VShopPersonal.exe -ArgumentList '--check-https --report https-check.json' -Wait -PassThru -WindowStyle Hidden
+    Get-Content https-check.json
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
-```
+test-assets/smoke-test.mp4는 자체 생성한 1초짜리 파란 화면과 무음의 H.264/AAC 테스트 파일입니다.
+실제 Riot 스킨 영상이나 계정 데이터를 포함하지 않습니다.
 
-빌드가 완료되면 다음 파일이 생성됩니다.
+## 로그와 확인 범위
 
-```text
-dist\VShopPersonal.exe
-```
+로그 위치: %LOCALAPPDATA%\VShopPersonal\logs\app.log.
+쓸 수 없으면 임시 폴더 아래에 저장합니다. 로그에는 인증 토큰·비밀번호·로그인 URL·예외 값을 저장하지 않습니다.
+오류 코드 위치에는 사용자 폴더 경로가 포함될 수 있습니다.
+OS가 Python 자체를 불러오기 전에 발생하는 오류는 앱 로그에 기록되지 않을 수 있습니다.
 
-이 EXE에는 Python, PySide6, Qt WebEngine이 함께 포함되므로 파일이 크고 첫 실행이
-느릴 수 있습니다. 개인 빌드에는 코드 서명이 없으므로 Windows SmartScreen이 경고를
-표시할 수도 있습니다.
+Riot 비공개 서비스의 변경/접근 제한은 패키징으로 해결되지 않습니다.
+실제 로그인·2단계 인증·개인 상점·잔액 및 실제 스킨 영상은 사용자의 계정/네트워크로 확인해야 합니다.
+다른 물리 PC나 깨끗한 Windows 가상 머신에서의 검사는 이번 로컬 검사와 별개입니다.
+배포 EXE는 코드 서명되지 않았습니다.
 
-가상환경이 없거나 삭제된 Python을 가리키면 빌드 스크립트가 정상 Python을 찾아
-가상환경을 생성합니다. 손상된 환경은 `.venv.backup-*`으로 보존합니다.
-Python이 PATH에 등록되어 있지 않으면 실행 파일 경로를 지정하세요.
+## 이번 빌드의 검사 상태
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build-exe.ps1 -PythonPath "C:\path\python.exe"
-```
-
-## 문제 해결
-
-- `HTTP 401/403`: 로그아웃한 뒤 다시 로그인합니다.
-- 클라이언트 버전 오류: 잠시 후 다시 실행합니다.
-- 로그인 페이지가 비어 있음: 인터넷 연결과 Riot 로그인 서비스 상태를 확인합니다.
-  이 앱은 Qt WebEngine을 사용하며 Edge WebView2를 사용하지 않습니다.
-- 상점 응답 오류: Riot의 비공개 엔드포인트가 변경됐을 가능성이 있습니다.
-
-## 파일 구성
-
-- `app.py`: 로그인 WebView, API 요청, 상점 UI
-- `requirements.txt`: Python 의존성
-- `requirements-build.txt`: EXE 빌드 의존성
-- `build-exe.ps1`: 단일 EXE 빌드 스크립트
-- `VShopPersonal.spec`: Python과 일치하는 OpenSSL DLL을 명시적으로 포함하는 빌드 설정
-
-## EXE의 HTTPS 통신 검사
-
-PowerShell에서 아래 명령을 실행하면 계정 로그인 없이 공개 버전 API로 검사합니다.
-검사 결과의 `ok`와 `frozen`이 모두 `true`이면 EXE 내부 HTTPS 요청이 성공한 것입니다.
-
-```powershell
-$check = Start-Process -FilePath .\dist\VShopPersonal.exe -ArgumentList '--check-https --report https-check.json' -Wait -PassThru
-Get-Content https-check.json
-```
-
-`unknown url type: https` 오류는 이번 빌드에서 호환되지 않는 System32 OpenSSL DLL이
-포함되면서 발생했습니다. `.spec`이 Python의 `_ssl.pyd`와 같은 폴더의 OpenSSL DLL을
-사용하도록 수정했습니다. 인증서 검증을 끄거나 Windows DLL을 변경하지 않습니다.
-빌드 설정 참고: https://pyinstaller.org/en/stable/spec-files.html
+HTTPS·상점 UI·영상 디코딩 검사는 통과했지만, 내장 브라우저 검사는 현재 실행 환경에서
+보안 프로세스 생성 오류(49)로 완료하지 못했습니다. 이전 배포본도 같은 환경에서 같은 오류가
+발생했습니다. 전체 검증 성공을 의미하지 않습니다. 자세한 내용은 validation/검증결과.md를 보세요.

@@ -1,0 +1,7 @@
+{
+  "ok": true,
+  "frozen": true,
+  "openssl": "OpenSSL 3.5.8 25 Aug 2026",
+  "https_handler": true,
+  "public_api_status": 200
+}

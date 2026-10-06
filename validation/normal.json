@@ -1,0 +1,19 @@
+{
+  "ok": false,
+  "reason": "Offline test timed out",
+  "checks": {
+    "tls_verification": true,
+    "three_shop_tabs": true,
+    "shop_cards": true,
+    "wallet_display": true,
+    "logout_clears_data": true,
+    "video_frame": true,
+    "video_cleanup": true
+  },
+  "frozen": true,
+  "python": "3.12.14",
+  "qt": "6.11.2",
+  "openssl": "OpenSSL 3.5.8 25 Aug 2026",
+  "software_rendering": false,
+  "machine": "AMD64"
+}

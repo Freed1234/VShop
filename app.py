@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sys
 import traceback
 import urllib.error
@@ -500,8 +501,13 @@ class Worker(QRunnable):
             # 예상 가능한 오류는 정리된 메시지만 UI로 전달한다.
             self.signals.failed.emit(str(exc))
         except Exception:
-            # 개발 중 확인할 수 있도록 예상 밖 오류는 콘솔에도 기록한다.
-            traceback.print_exc()
+            # 개발 중 확인할 수 있도록 예상 밖 오류의 종류와 코드 위치를 로그에 기록한다.
+            exc_type, _, exc_tb = sys.exc_info()
+            logging.getLogger('vshop').error(
+                'Worker failure: %s\n%s',
+                exc_type.__name__ if exc_type else 'unknown',
+                ''.join(traceback.format_tb(exc_tb)),
+            )
             self.signals.failed.emit("예상하지 못한 오류가 발생했습니다.")
 
 
@@ -910,10 +916,36 @@ class MainWindow(QMainWindow):
         self.web_view.setPage(self.web_page)
         # 로그인 성공 후 주소가 바뀌면 access_token 포함 여부를 검사한다.
         self.web_view.urlChanged.connect(self.on_login_url_changed)
+        self.web_view.loadFinished.connect(self.on_login_load_finished)
+        self.web_page.renderProcessTerminated.connect(self.on_renderer_terminated)
 
         layout.addLayout(top)
         layout.addWidget(self.web_view, 1)
         return page
+
+    @Slot(bool)
+    def on_login_load_finished(self, ok: bool) -> None:
+        if '--self-test' in sys.argv:
+            return
+        if (not ok and not self.auth_handled
+                and self.pages.currentWidget() == self.login_page):
+            logging.getLogger('vshop').warning('Login page load failed')
+            QMessageBox.warning(
+                self, '로그인 페이지 오류',
+                '로그인 페이지를 불러오지 못했습니다. 인터넷 연결을 확인하고 다시 시도해 주세요. '
+                '빈 화면이 계속되면 앱을 닫고 Run-Compatibility.cmd로 실행해 주세요.',
+            )
+
+    def on_renderer_terminated(self, status: Any, exit_code: int) -> None:
+        logging.getLogger('vshop').error('WebEngine stopped: status=%s code=%s',
+                                       status, exit_code)
+        if '--self-test' in sys.argv:
+            return
+        if self.pages.currentWidget() == self.login_page:
+            QMessageBox.warning(
+                self, '로그인 화면 종료',
+                '내장 브라우저가 종료되었습니다. 앱을 닫고 Run-Compatibility.cmd로 다시 실행해 주세요.',
+            )
 
     # 이 코드 단락은 상점 정보를 가져오는 동안 사용자에게 잠시 기다리는 화면을 보여줌
     def build_loading_page(self) -> QWidget:

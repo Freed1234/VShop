@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "reason": "WebEngine HTML load failed",
+  "frozen": true,
+  "python": "3.12.14",
+  "qt": "6.11.2",
+  "software_rendering": false,
+  "machine": "AMD64"
+}
